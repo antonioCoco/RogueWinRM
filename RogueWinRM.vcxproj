@@ -157,10 +157,16 @@
     <ClCompile Include="base64.cpp" />
     <ClCompile Include="RogueWinRM.cpp" />
     <ClCompile Include="LocalNegotiator.cpp" />
+    <ClCompile Include="spnegotokenhandler\derparse.c" />
+    <ClCompile Include="spnegotokenhandler\spnego.c" />
+    <ClCompile Include="spnegotokenhandler\spnegoparse.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="base64.h" />
     <ClInclude Include="LocalNegotiator.h" />
+    <ClInclude Include="spnegotokenhandler\derparse.h" />
+    <ClInclude Include="spnegotokenhandler\spnego.h" />
+    <ClInclude Include="spnegotokenhandler\spnegoparse.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

