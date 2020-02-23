@@ -204,7 +204,7 @@ int spnegoCreateNegTokenInit(SPNEGO_MECH_OID MechType,
 int spnegoCreateNegTokenTarg(SPNEGO_MECH_OID MechType,
 	SPNEGO_NEGRESULT spnegoNegResult, unsigned char* pbMechToken,
 	unsigned long ulMechTokenLen, unsigned char* pbMechListMIC,
-	unsigned long ulMechListMICLen, SPNEGO_TOKEN_HANDLE* phSpnegoToken, int endianess)
+	unsigned long ulMechListMICLen, SPNEGO_TOKEN_HANDLE* phSpnegoToken)
 {
 	int   nReturn = SPNEGO_E_INVALID_PARAMETER;
 	long  nTokenLength = 0L;

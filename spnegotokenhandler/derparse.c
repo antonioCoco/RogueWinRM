@@ -97,7 +97,6 @@ int ASNDerGetLength(unsigned char* pbLengthData, long nBoundaryLength, long* pnL
 
 				// Bump by 1 byte
 				pbLengthData++;
-				printf("\nendianess: %d\n", endianess);
 #ifdef __LITTLE_ENDIAN__
 
 				// There may be a cleaner way to do this, but for now, this seems to be
